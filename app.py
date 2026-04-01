@@ -235,6 +235,18 @@ def extend_seat():
     return jsonify(result), code
 
 
+@app.route("/", methods=["GET"])
+def root():
+    """브라우저로 주소만 열었을 때도 동작 확인용."""
+    return jsonify(
+        {
+            "ok": True,
+            "hint": "GET /health 로 연장 설정 여부도 확인 가능",
+            "extend_configured": bool(EXTEND_URL_TEMPLATE and EXTEND_URL_TEMPLATE.strip()),
+        }
+    )
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "extend_configured": bool(EXTEND_URL_TEMPLATE and EXTEND_URL_TEMPLATE.strip())})
