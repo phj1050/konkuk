@@ -14,6 +14,7 @@
       --accent-dim: #2a6fd6;
       --danger: #f07178;
       --ok: #7fd99a;
+      --warn: #ffd580;
       --radius: 14px;
       --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
     }
@@ -79,7 +80,75 @@
     }
     .card h2 { margin: 0 0 12px; font-size: 0.9rem; font-weight: 700; color: #cbd5e1; }
 
-    button {
+    /* ── 인증 방식 토글 ── */
+    .method-group {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .method-btn {
+      flex: 1;
+      padding: 10px 8px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #121920;
+      color: var(--muted);
+      cursor: pointer;
+      text-align: center;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+      margin: 0;
+      width: auto;
+    }
+    .method-btn.active {
+      background: rgba(61, 139, 253, 0.15);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .method-btn .icon { display: block; font-size: 1.3rem; margin-bottom: 3px; }
+    .method-btn .label { display: block; }
+
+    /* ── NFC 입력 슬라이드 ── */
+    .nfc-row {
+      overflow: hidden;
+      max-height: 0;
+      opacity: 0;
+      transition: max-height 0.28s ease, opacity 0.22s ease, margin 0.22s;
+      margin-bottom: 0;
+    }
+    .nfc-row.visible {
+      max-height: 100px;
+      opacity: 1;
+      margin-bottom: 12px;
+    }
+
+    /* ── GPS 좌표 배지 ── */
+    .gps-badge {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 11px;
+      background: rgba(61, 139, 253, 0.08);
+      border: 1px solid rgba(61, 139, 253, 0.25);
+      border-radius: 8px;
+      font-size: 0.72rem;
+      color: #7ab3f5;
+      margin-bottom: 12px;
+    }
+    .gps-badge .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #3d8bfd;
+      flex-shrink: 0;
+      animation: pulse 1.8s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(1.3); }
+    }
+
+    button.primary {
       width: 100%;
       margin-top: 12px;
       padding: 14px 16px;
@@ -88,15 +157,20 @@
       border: none;
       border-radius: 12px;
       cursor: pointer;
-    }
-    button.primary {
       color: #fff;
       background: linear-gradient(180deg, var(--accent) 0%, var(--accent-dim) 100%);
     }
     button.secondary {
+      width: 100%;
+      margin-top: 12px;
+      padding: 14px 16px;
+      font-size: 1rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      cursor: pointer;
       color: #e8eef4;
       background: #2a3544;
-      border: 1px solid var(--border);
     }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
 
@@ -111,7 +185,7 @@
       background: rgba(0, 0, 0, 0.2);
       color: var(--muted);
     }
-    .status.ok { border-color: rgba(127, 217, 154, 0.4); color: var(--ok); }
+    .status.ok  { border-color: rgba(127, 217, 154, 0.4); color: var(--ok); }
     .status.err { border-color: rgba(240, 113, 120, 0.4); color: var(--danger); }
     .status strong {
       display: block;
@@ -136,6 +210,32 @@
 
     <div class="card">
       <h2>배정 확정</h2>
+
+      <label>인증 방식</label>
+      <div class="method-group">
+        <button type="button" class="method-btn active" data-method="GPS" id="btnGps">
+          <span class="icon">📡</span>
+          <span class="label">GPS 인증</span>
+        </button>
+        <button type="button" class="method-btn" data-method="RF_TAG" id="btnNfc">
+          <span class="icon">📲</span>
+          <span class="label">NFC 인증</span>
+        </button>
+      </div>
+
+      <!-- GPS 안내 배지 -->
+      <div class="gps-badge" id="gpsBadge">
+        <span class="dot"></span>
+        건국대 도서관 좌표 (37.5407, 127.0793) 자동 사용
+      </div>
+
+      <!-- NFC 번호 입력 (숨김) -->
+      <div class="nfc-row" id="nfcRow">
+        <label for="nfcSerial">NFC 태그 고유번호</label>
+        <input type="text" id="nfcSerial" inputmode="text" placeholder="리더기에 표시된 번호 입력" autocomplete="off" />
+        <p class="hint" style="margin-top:5px;">도서관 좌석 리더기에 적혀 있거나, 앱 Network 탭에서 serialNo 값을 확인하세요.</p>
+      </div>
+
       <label for="roomId">열람실 번호</label>
       <input type="text" id="roomId" inputmode="numeric" placeholder="예: 1" autocomplete="off" />
       <button type="button" class="primary" id="btnConfirm">원격 확정</button>
@@ -158,6 +258,7 @@
 
   <script>
     (function () {
+      /* ── 백엔드 주소 저장 ── */
       const LS = "kkulib_api_base_v3";
       const def = "http://127.0.0.1:5000";
       const q = new URLSearchParams(location.search).get("api");
@@ -171,14 +272,40 @@
         return (el.value || def).trim().replace(/\/$/, "");
       }
 
+      /* ── 인증 방식 토글 ── */
+      let selectedMethod = "GPS";
+      const btnGps  = document.getElementById("btnGps");
+      const btnNfc  = document.getElementById("btnNfc");
+      const gpsBadge = document.getElementById("gpsBadge");
+      const nfcRow   = document.getElementById("nfcRow");
+
+      function selectMethod(method) {
+        selectedMethod = method;
+        btnGps.classList.toggle("active", method === "GPS");
+        btnNfc.classList.toggle("active", method === "RF_TAG");
+
+        if (method === "GPS") {
+          gpsBadge.style.display = "flex";
+          nfcRow.classList.remove("visible");
+        } else {
+          gpsBadge.style.display = "none";
+          nfcRow.classList.add("visible");
+        }
+      }
+
+      btnGps.addEventListener("click", () => selectMethod("GPS"));
+      btnNfc.addEventListener("click", () => selectMethod("RF_TAG"));
+
+      /* ── 상태 표시 ── */
       function setStatus(elId, text, variant) {
         const node = document.getElementById(elId);
         node.classList.remove("ok", "err");
-        if (variant === "ok") node.classList.add("ok");
+        if (variant === "ok")  node.classList.add("ok");
         if (variant === "err") node.classList.add("err");
         node.innerHTML = "<strong>결과</strong>" + String(text).replace(/\n/g, "<br />");
       }
 
+      /* ── 공통 POST ── */
       async function post(path, json) {
         const res = await fetch(base() + path, {
           method: "POST",
@@ -186,28 +313,41 @@
           body: JSON.stringify(json),
         });
         let payload;
-        try {
-          payload = await res.json();
-        } catch {
-          payload = { success: false, message: "JSON 파싱 실패" };
-        }
+        try { payload = await res.json(); }
+        catch { payload = { success: false, message: "JSON 파싱 실패" }; }
         return { res, payload };
       }
 
+      /* ── 배정 확정 버튼 ── */
       document.getElementById("btnConfirm").addEventListener("click", async function () {
         const room = document.getElementById("roomId").value.trim();
-        if (!room) {
-          alert("열람실 번호를 입력하세요.");
-          return;
+        if (!room) { alert("열람실 번호를 입력하세요."); return; }
+
+        // NFC 방식인데 번호 없을 때
+        if (selectedMethod === "RF_TAG") {
+          const serial = document.getElementById("nfcSerial").value.trim();
+          if (!serial) { alert("NFC 태그 고유번호를 입력하세요."); return; }
         }
+
         this.disabled = true;
-        setStatus("statusConfirm", "로그인 후 요청 중…", null);
+        const methodLabel = selectedMethod === "GPS" ? "GPS" : "NFC(RF_TAG)";
+        setStatus("statusConfirm", `${methodLabel} 방식으로 로그인 후 요청 중…`, null);
+
         try {
-          const { payload } = await post("/auto-confirm", { room_id: room });
-          const ok = payload.success === true;
+          const body = {
+            room_id: room,
+            auth_method: selectedMethod,
+          };
+          if (selectedMethod === "RF_TAG") {
+            body.nfc_serial = document.getElementById("nfcSerial").value.trim();
+          }
+
+          const { payload } = await post("/auto-confirm", body);
+          const ok  = payload.success === true;
           const msg = payload.message != null ? String(payload.message) : JSON.stringify(payload, null, 2);
           const code = payload.status_code != null ? "HTTP " + payload.status_code : "";
-          const line = (ok ? "성공 " : "실패 ") + code + "\n" + msg;
+          const used = payload.auth_method_used ? `[${payload.auth_method_used}] ` : "";
+          const line = (ok ? "✅ 성공 " : "❌ 실패 ") + used + code + "\n" + msg;
           setStatus("statusConfirm", line, ok ? "ok" : "err");
           alert(line);
         } catch (e) {
@@ -219,6 +359,7 @@
         }
       });
 
+      /* ── 연장 버튼 ── */
       document.getElementById("btnExtend").addEventListener("click", async function () {
         this.disabled = true;
         setStatus("statusExtend", "로그인 후 요청 중…", null);
@@ -229,10 +370,10 @@
           const uid = document.getElementById("usageId").value.trim();
           if (uid && body.usage_id === undefined) body.usage_id = uid;
           const { payload } = await post("/extend", body);
-          const ok = payload.success === true;
+          const ok  = payload.success === true;
           const msg = payload.message != null ? String(payload.message) : JSON.stringify(payload, null, 2);
           const code = payload.status_code != null ? "HTTP " + payload.status_code : "";
-          const line = (ok ? "성공 " : "실패 ") + code + "\n" + msg;
+          const line = (ok ? "✅ 성공 " : "❌ 실패 ") + code + "\n" + msg;
           setStatus("statusExtend", line, ok ? "ok" : "err");
           alert(line);
         } catch (e) {
