@@ -1,8 +1,8 @@
 """
 건국대 도서관 SMUF: 원격 배정 확정(check-arrival) + 연장(extend) 프록시.
 
-- 확정: rooms/{room_id}/check-arrival + {"methodCode": "GATE"}
-- 연장: 아래 EXTEND_* 를 Network 캡처 후 채움 (비어 있으면 안내 응답만 반환)
+- 매 요청마다 auto_login() 으로 토큰 발급 후 check-arrival / extend 호출
+- 자격 증명: 환경 변수 LIBRARY_ID, LIBRARY_PW (.env 권장, GitHub 에 올리지 말 것)
 """
 from __future__ import annotations
 
@@ -23,13 +23,15 @@ app = Flask(__name__)
 CORS(app)
 
 # ---------------------------------------------------------------------------
-# pyxis-auth-token (우선순위)
-#  1) 환경 변수 PYXIS_AUTH_TOKEN
-#  2) 프로젝트 폴더의 .env 파일 ( pip install python-dotenv 후 KEY=값 형식 )
-#  3) 아래 문자열(비워 두지 말 것 — GitHub 에 올릴 때는 반드시 제거·.env 사용)
-# 만료 시: .env 또는 Render 환경 변수만 갱신 (app.py 수정 불필요)
+# .env 예시 (프로젝트 폴더에 .env 파일 생성, 한 줄씩):
+#
+#   LIBRARY_ID=건국대통합로그인아이디
+#   LIBRARY_PW=비밀번호
+#
+# - 공백 없이 = 양쪽에 붙여 쓰기
+# - 비밀번호에 # 이나 따옴표가 있으면 값 전체를 큰따옴표로 감싸기
+# - Render: Dashboard → Environment → Add LIBRARY_ID, LIBRARY_PW
 # ---------------------------------------------------------------------------
-PYXIS_AUTH_TOKEN = (os.environ.get("PYXIS_AUTH_TOKEN") or "").strip() or "여기에_토큰_입력"
 
 BASE = "https://library.konkuk.ac.kr/pyxis-api/1/api"
 
@@ -39,40 +41,81 @@ USER_AGENT = (
     "Mobile/15E148 Safari/604.1"
 )
 
+# 제미나이 스펙 URL + 실제 배포에서 흔한 /1/ 경로 (앞에서 실패 시 순차 시도)
+LOGIN_URLS = (
+    "https://library.konkuk.ac.kr/pyxis-api/api/login",
+    "https://library.konkuk.ac.kr/pyxis-api/1/api/login",
+)
+
 CHECK_ARRIVAL_TEMPLATE = BASE + "/rooms/{room_id}/check-arrival"
 
-# ---------------------------------------------------------------------------
-# 연장 API — 도서관에서 [연장] 누를 때 Network 에 찍힌 Request URL / Payload 를 반영하세요.
-# 템플릿에 {usage_id} 가 있으면 POST JSON 의 "usage_id" 로 치환합니다.
-# 아직 모르면 빈 문자열로 두면 /extend 는 설정 방법을 JSON 으로 알려줍니다.
-# ---------------------------------------------------------------------------
 EXTEND_URL_TEMPLATE = ""
-# 예시(가짜): f"{BASE}/seat-usages/{{usage_id}}/extend"
 EXTEND_HTTP_METHOD = "POST"
-# 연장 요청 본문. 캡처한 JSON 그대로 쓰거나, 필요 시 usage_id 만 넣는 형태로 수정.
 EXTEND_PAYLOAD_TEMPLATE: dict | None = None
-# None 이면 {"usage_id": ...} 를 그대로 도서관으로 전달(캡처한 키 이름에 맞게 프론트에서 보냄).
 
 
-def _token_from_request(body: dict | None) -> str | None:
-    """요청 헤더 또는 JSON 의 pyxis_auth_token. 없으면 None."""
-    h = request.headers.get("X-Pyxis-Auth-Token") or request.headers.get("pyxis-auth-token")
-    if h and str(h).strip():
-        return str(h).strip()
-    if body and isinstance(body, dict):
-        t = body.get("pyxis_auth_token")
-        if t is not None and str(t).strip():
+def auto_login() -> tuple[str | None, str | None]:
+    """
+    도서관 로그인 API 호출 후 토큰 문자열 반환.
+    성공: (token, None) / 실패: (None, 사람이 읽을 수 있는 메시지)
+    """
+    login_id = (os.environ.get("LIBRARY_ID") or "").strip()
+    password = (os.environ.get("LIBRARY_PW") or "").strip()
+    if not login_id or not password:
+        return None, "LIBRARY_ID 또는 LIBRARY_PW 가 환경 변수(.env)에 설정되어 있지 않습니다."
+
+    payload = {
+        "loginId": login_id,
+        "password": password,
+        "isFamilyLogin": False,
+        "isMobile": True,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    last_detail = ""
+
+    for login_url in LOGIN_URLS:
+        try:
+            resp = requests.post(login_url, json=payload, headers=headers, timeout=30)
+        except requests.RequestException as exc:
+            last_detail = f"{login_url}: 연결 실패 ({exc})"
+            continue
+
+        # 응답 헤더 (대소문자 무관)
+        for key, val in resp.headers.items():
+            if key.lower() == "pyxis-auth-token" and val and str(val).strip():
+                return str(val).strip(), None
+
+        try:
+            body = resp.json()
+        except ValueError:
+            last_detail = f"{login_url}: HTTP {resp.status_code} (JSON 아님)"
+            continue
+
+        token = _extract_access_token_from_json(body)
+        if token:
+            return token, None
+
+        last_detail = f"{login_url}: HTTP {resp.status_code} — {body}"
+
+    return None, last_detail or "로그인 응답에서 pyxis-auth-token / accessToken 을 찾지 못했습니다."
+
+
+def _extract_access_token_from_json(body: object) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    # 최상위
+    t = body.get("accessToken")
+    if t and str(t).strip():
+        return str(t).strip()
+    data = body.get("data")
+    if isinstance(data, dict):
+        t = data.get("accessToken")
+        if t and str(t).strip():
             return str(t).strip()
-    return None
-
-
-def _effective_token(body: dict | None) -> str | None:
-    t = _token_from_request(body)
-    if t:
-        return t
-    env = (PYXIS_AUTH_TOKEN or "").strip()
-    if env and env != "여기에_토큰_입력":
-        return env
     return None
 
 
@@ -125,19 +168,19 @@ def auto_confirm():
             }
         ), 400
 
-    room_id_str = str(room_id).strip()
-    url = CHECK_ARRIVAL_TEMPLATE.format(room_id=room_id_str)
-    payload = {"methodCode": "GATE"}
-
-    token = _effective_token(body)
+    token, err = auto_login()
     if not token:
         return jsonify(
             {
                 "success": False,
-                "message": "토큰이 없습니다. 서버 환경변수(.env)에 넣거나, 웹 화면의 토큰 칸에 붙여 넣으세요.",
+                "message": f"자동 로그인 실패: {err}",
                 "status_code": None,
             }
-        ), 400
+        ), 502
+
+    room_id_str = str(room_id).strip()
+    url = CHECK_ARRIVAL_TEMPLATE.format(room_id=room_id_str)
+    payload = {"methodCode": "GATE"}
 
     try:
         resp = requests.post(url, json=payload, headers=_headers(token), timeout=30)
@@ -166,8 +209,7 @@ def extend_seat():
                 "success": False,
                 "message": (
                     "연장 API URL 이 아직 설정되지 않았습니다. app.py 의 EXTEND_URL_TEMPLATE 에 "
-                    "도서관 사이트에서 [연장] 클릭 시 Network 에 나온 Request URL 을 넣고, "
-                    "필요하면 EXTEND_PAYLOAD_TEMPLATE 를 캡처한 본문으로 맞추세요."
+                    "도서관 사이트에서 [연장] 클릭 시 Network 에 나온 Request URL 을 넣으세요."
                 ),
                 "status_code": None,
             }
@@ -176,6 +218,16 @@ def extend_seat():
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         body = {}
+
+    token, err = auto_login()
+    if not token:
+        return jsonify(
+            {
+                "success": False,
+                "message": f"자동 로그인 실패: {err}",
+                "status_code": None,
+            }
+        ), 502
 
     usage_id = body.get("usage_id")
     url = EXTEND_URL_TEMPLATE.strip()
@@ -189,16 +241,6 @@ def extend_seat():
                 }
             ), 400
         url = url.format(usage_id=str(usage_id).strip())
-
-    token = _effective_token(body)
-    if not token:
-        return jsonify(
-            {
-                "success": False,
-                "message": "토큰이 없습니다. 서버 환경변수(.env)에 넣거나, 웹 화면의 토큰 칸에 붙여 넣으세요.",
-                "status_code": None,
-            }
-        ), 400
 
     if EXTEND_PAYLOAD_TEMPLATE is not None:
         payload = dict(EXTEND_PAYLOAD_TEMPLATE)
@@ -237,11 +279,11 @@ def extend_seat():
 
 @app.route("/", methods=["GET"])
 def root():
-    """브라우저로 주소만 열었을 때도 동작 확인용."""
+    creds = bool((os.environ.get("LIBRARY_ID") or "").strip() and (os.environ.get("LIBRARY_PW") or "").strip())
     return jsonify(
         {
             "ok": True,
-            "hint": "GET /health 로 연장 설정 여부도 확인 가능",
+            "auto_login_configured": creds,
             "extend_configured": bool(EXTEND_URL_TEMPLATE and EXTEND_URL_TEMPLATE.strip()),
         }
     )
@@ -249,10 +291,16 @@ def root():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "extend_configured": bool(EXTEND_URL_TEMPLATE and EXTEND_URL_TEMPLATE.strip())})
+    creds = bool((os.environ.get("LIBRARY_ID") or "").strip() and (os.environ.get("LIBRARY_PW") or "").strip())
+    return jsonify(
+        {
+            "ok": True,
+            "auto_login_configured": creds,
+            "extend_configured": bool(EXTEND_URL_TEMPLATE and EXTEND_URL_TEMPLATE.strip()),
+        }
+    )
 
 
 if __name__ == "__main__":
-    # Render 등 클라우드는 PORT 환경 변수를 줌. 로컬은 기본 5000.
     _port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=_port, debug=True)

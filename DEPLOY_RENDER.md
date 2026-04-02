@@ -82,7 +82,8 @@ git push -u origin main
 
 | Key | Value |
 |-----|--------|
-| `PYXIS_AUTH_TOKEN` | F12 로 복사한 **pyxis-auth-token** 값 (선택: 나중에 넣어도 됨) |
+| `LIBRARY_ID` | 건국대 통합/도서관 로그인 아이디 |
+| `LIBRARY_PW` | 비밀번호 (**GitHub 에 절대 커밋하지 말 것**, Render 환경 변수만 사용 권장) |
 
 5. **Create Web Service** 클릭.
 6. **Logs** 가 돌아가며 빌드됨. 몇 분 걸릴 수 있음.
@@ -99,7 +100,7 @@ git push -u origin main
 
    (끝에 `/` 있으면 지워도 됨.)
 
-3. **토큰 칸**에 F12 로 복사한 값을 붙여 넣고, 다른 칸 클릭해서 저장되게 한다(이 브라우저에 저장).
+3. 로그인은 **서버**가 `LIBRARY_ID` / `LIBRARY_PW` 로 자동 처리한다. HTML 에 토큰을 넣을 필요 없음.
 
 또는 URL 로 한 번에:
 
@@ -114,8 +115,6 @@ git push -u origin main
 
 ---
 
-## 6. 토큰을 Render 에만 넣고 싶을 때
+## 6. 비밀번호·아이디 변경 시
 
-- Render 대시보드 → 해당 Web Service → **Environment** → `PYXIS_AUTH_TOKEN` 수정 → **Save** → 자동 재배포.
-
-웹 페이지 **토큰 칸은 비워 두면** 서버(Render 환경 변수)만 사용합니다.
+- Render 대시보드 → 해당 Web Service → **Environment** → `LIBRARY_ID` / `LIBRARY_PW` 수정 → **Save** → 자동 재배포.
