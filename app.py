@@ -178,7 +178,6 @@ def _build_checkarrival_payload(auth_method: str, nfc_serial: str | None) -> tup
         }, None
 
     elif method == "GATE":
-        # 기존 방식: 좌석 상태가 안 바뀌는 경우가 있어 비권장이지만 호환을 위해 남겨 둠
         return {"methodCode": "GATE"}, None
 
     else:
@@ -230,7 +229,8 @@ def auto_confirm():
     url = CHECK_ARRIVAL_TEMPLATE.format(room_id=room_id_str)
 
     try:
-        resp = requests.post(url, json=payload, headers=_headers(token), timeout=30)
+        # ★★★ 여기가 멍청하게 막혀있던 원흉입니다. json=[payload] 로 배열 처리! ★★★
+        resp = requests.post(url, json=[payload], headers=_headers(token), timeout=30)
     except requests.RequestException as exc:
         return jsonify({
             "success": False,
