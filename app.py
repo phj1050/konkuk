@@ -298,6 +298,7 @@ def _fetch_seat_context(token: str, homepage_ids: list[int]) -> tuple[dict | Non
             "total_count": total_count,
             "message": wrapped.get("message"),
             "data_type": type(data).__name__,
+            "data_keys": list(data.keys())[:20] if isinstance(data, dict) else None,
         })
 
         if not wrapped.get("success"):
@@ -318,6 +319,42 @@ def _fetch_seat_context(token: str, homepage_ids: list[int]) -> tuple[dict | Non
         "Possible causes: account mismatch (LIBRARY_ID/PW), expired reservation, or different API shape. "
         f"(traces={traces})"
     )
+
+
+def _scan_seat_charges(token: str, homepage_ids: list[int]) -> list[dict]:
+    rows: list[dict] = []
+    for homepage_id in homepage_ids:
+        url = _seat_charges_url(homepage_id)
+        row: dict[str, object] = {"homepage_id": homepage_id, "url": url}
+        try:
+            resp = requests.get(url, headers=_headers(token), timeout=30)
+        except requests.RequestException as exc:
+            row["request_error"] = str(exc)
+            rows.append(row)
+            continue
+
+        wrapped: dict = {}
+        _attach_json(wrapped, resp)
+        row["status_code"] = wrapped.get("status_code")
+        row["success"] = wrapped.get("success")
+        row["message"] = wrapped.get("message")
+        data = wrapped.get("data")
+        row["data_type"] = type(data).__name__
+        if isinstance(data, dict):
+            row["data_keys"] = list(data.keys())[:30]
+            maybe_list = data.get("list")
+            row["list_len"] = len(maybe_list) if isinstance(maybe_list, list) else None
+            if isinstance(maybe_list, list) and maybe_list and isinstance(maybe_list[0], dict):
+                row["first_item_keys"] = list(maybe_list[0].keys())[:30]
+                row["first_item"] = maybe_list[0]
+        elif isinstance(data, list):
+            row["list_len"] = len(data)
+            if data and isinstance(data[0], dict):
+                row["first_item_keys"] = list(data[0].keys())[:30]
+                row["first_item"] = data[0]
+
+        rows.append(row)
+    return rows
 
 
 def _infer_business_success(http_ok: bool, parsed: object | None, message: str | None) -> bool:
@@ -735,6 +772,25 @@ def debug_seat_context():
 
     code = 200 if result["success"] else 400
     return jsonify(result), code
+
+
+@app.route("/debug-seat-context-raw", methods=["GET"])
+def debug_seat_context_raw():
+    homepage_ids = _parse_homepage_ids(request.args.get("homepage_ids") or os.environ.get("HOMEPAGE_IDS"))
+    token, err = auto_login()
+    if not token:
+        return jsonify({
+            "success": False,
+            "message": f"auto login failed: {err}",
+            "status_code": None,
+        }), 502
+
+    rows = _scan_seat_charges(token, homepage_ids)
+    return jsonify({
+        "success": True,
+        "homepage_ids_tried": homepage_ids,
+        "rows": rows,
+    }), 200
 
 
 @app.route("/", methods=["GET"])
