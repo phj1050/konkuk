@@ -236,8 +236,12 @@
         <p class="hint" style="margin-top:5px;">도서관 좌석 리더기에 적혀 있거나, 앱 Network 탭에서 serialNo 값을 확인하세요.</p>
       </div>
 
-      <label for="roomId">열람실 번호</label>
-      <input type="text" id="roomId" inputmode="numeric" placeholder="예: 1" autocomplete="off" />
+      <label for="roomId">열람실 번호 (선택)</label>
+      <input type="text" id="roomId" inputmode="numeric" placeholder="비워두면 활성 예약 room.id 자동 사용" autocomplete="off" />
+      <label style="display:flex; align-items:center; gap:8px; font-size:0.8rem; margin-top:8px; margin-bottom:6px; color:var(--text);">
+        <input type="checkbox" id="useActiveContext" checked />
+        활성 예약 정보(room.id) 자동 사용
+      </label>
 
       <label for="gpsLat">GPS 위도 (선택)</label>
       <input type="text" id="gpsLat" inputmode="decimal" placeholder="비워두면 서버 기본값 사용" autocomplete="off" />
@@ -334,7 +338,6 @@
       /* ── 배정 확정 버튼 ── */
       document.getElementById("btnConfirm").addEventListener("click", async function () {
         const room = document.getElementById("roomId").value.trim();
-        if (!room) { alert("열람실 번호를 입력하세요."); return; }
 
         // NFC 방식인데 번호 없을 때
         if (selectedMethod === "RF_TAG") {
@@ -348,14 +351,15 @@
 
         try {
           const body = {
-            room_id: room,
             auth_method: selectedMethod,
           };
+          if (room) body.room_id = room;
           const lat = document.getElementById("gpsLat").value.trim();
           const lng = document.getElementById("gpsLng").value.trim();
           if (lat) body.latitude = lat;
           if (lng) body.longitude = lng;
           body.debug = document.getElementById("debugMode").checked === true;
+          body.use_active_context = document.getElementById("useActiveContext").checked === true;
           if (selectedMethod === "RF_TAG") {
             body.nfc_serial = document.getElementById("nfcSerial").value.trim();
           }

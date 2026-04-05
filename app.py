@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
+from zoneinfo import ZoneInfo
 
 try:
     from dotenv import load_dotenv
@@ -31,6 +33,7 @@ LOGIN_URLS = (
 )
 
 CHECK_ARRIVAL_TEMPLATE = BASE + "/rooms/{room_id}/check-arrival"
+SEAT_CHARGES_URL = BASE + "/seat-charges"
 
 DEFAULT_LIBRARY_LATITUDE = float(os.environ.get("LIBRARY_LATITUDE", "37.539182674872"))
 DEFAULT_LIBRARY_LONGITUDE = float(os.environ.get("LIBRARY_LONGITUDE", "127.074711902268"))
@@ -38,6 +41,7 @@ DEFAULT_LIBRARY_LONGITUDE = float(os.environ.get("LIBRARY_LONGITUDE", "127.07471
 EXTEND_URL_TEMPLATE = ""
 EXTEND_HTTP_METHOD = "POST"
 EXTEND_PAYLOAD_TEMPLATE: dict | None = None
+KST = ZoneInfo("Asia/Seoul")
 
 
 def auto_login() -> tuple[str | None, str | None]:
@@ -118,6 +122,19 @@ def _to_float(val: object) -> float | None:
         return None
 
 
+def _to_bool(val: object, default: bool = False) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    text = str(val).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _build_serial_variants(raw_serial: str) -> list[str]:
     raw = (raw_serial or "").strip()
     if not raw:
@@ -144,6 +161,87 @@ def _build_serial_variants(raw_serial: str) -> list[str]:
         _add(reversed_compact)
 
     return variants
+
+
+def _collect_key_values(node: object, target_key: str) -> list[object]:
+    found: list[object] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == target_key:
+                found.append(v)
+            found.extend(_collect_key_values(v, target_key))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_collect_key_values(item, target_key))
+    return found
+
+
+def _dedupe_preserve(values: list[object]) -> list[object]:
+    result: list[object] = []
+    seen: set[str] = set()
+    for v in values:
+        key = repr(v)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(v)
+    return result
+
+
+def _parse_kst_datetime(text: object) -> datetime | None:
+    if text is None:
+        return None
+    try:
+        dt = datetime.strptime(str(text).strip(), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=KST)
+
+
+def _extract_active_charge(data: object) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    items = data.get("list")
+    if not isinstance(items, list):
+        return None
+
+    typed = [it for it in items if isinstance(it, dict)]
+    if not typed:
+        return None
+
+    checkinable = [it for it in typed if bool(it.get("isCheckinable"))]
+    candidates = checkinable if checkinable else typed
+
+    def _score(item: dict) -> tuple:
+        expiry = _parse_kst_datetime(item.get("checkinExpiryDate"))
+        created = _parse_kst_datetime(item.get("dateCreated"))
+        return (
+            1 if bool(item.get("isCheckinable")) else 0,
+            expiry or datetime.min.replace(tzinfo=KST),
+            created or datetime.min.replace(tzinfo=KST),
+        )
+
+    candidates.sort(key=_score, reverse=True)
+    return candidates[0]
+
+
+def _fetch_seat_context(token: str) -> tuple[dict | None, str | None]:
+    try:
+        resp = requests.get(SEAT_CHARGES_URL, headers=_headers(token), timeout=30)
+    except requests.RequestException as exc:
+        return None, f"seat-charges request failed: {exc}"
+
+    wrapped: dict = {}
+    _attach_json(wrapped, resp)
+    if not wrapped.get("success"):
+        return None, f"seat-charges failed: {wrapped.get('message')}"
+
+    data = wrapped.get("data")
+    active = _extract_active_charge(data)
+    if not active:
+        return None, "no active reservation found in seat-charges"
+
+    return {"wrapped": wrapped, "active": active}, None
 
 
 def _infer_business_success(http_ok: bool, parsed: object | None, message: str | None) -> bool:
@@ -268,18 +366,11 @@ def auto_confirm():
     if not isinstance(body, dict):
         body = {}
 
-    room_id = body.get("room_id")
-    if room_id is None or (isinstance(room_id, str) and not str(room_id).strip()):
-        return jsonify({
-            "success": False,
-            "message": "room_id is required",
-            "status_code": None,
-        }), 400
-
     auth_method = str(body.get("auth_method") or "GPS").strip()
     auth_method_norm = auth_method.upper()
     nfc_serial = body.get("nfc_serial") or body.get("serialNo")
     debug = bool(body.get("debug"))
+    use_active_context = _to_bool(body.get("use_active_context"), default=True)
 
     latitude = _to_float(body.get("latitude"))
     longitude = _to_float(body.get("longitude"))
@@ -314,7 +405,59 @@ def auto_confirm():
             "status_code": None,
         }), 502
 
-    room_id_str = str(room_id).strip()
+    seat_ctx, seat_ctx_err = _fetch_seat_context(token)
+    if not seat_ctx:
+        return jsonify({
+            "success": False,
+            "message": seat_ctx_err or "failed to fetch seat context",
+            "status_code": None,
+        }), 400
+
+    active_charge = seat_ctx["active"]
+    active_room_id = (
+        active_charge.get("room", {}).get("id")
+        if isinstance(active_charge.get("room"), dict)
+        else None
+    )
+    allowed_methods = active_charge.get("arrivalConfirmMethods")
+    if not isinstance(allowed_methods, list):
+        allowed_methods = []
+
+    expiry_text = active_charge.get("checkinExpiryDate")
+    expiry_dt = _parse_kst_datetime(expiry_text)
+    now_kst = datetime.now(KST)
+    if expiry_dt and now_kst > expiry_dt:
+        return jsonify({
+            "success": False,
+            "message": f"check-in expired at {expiry_text} (KST)",
+            "status_code": 400,
+            "active_room_id": active_room_id,
+        }), 400
+
+    room_id_input = body.get("room_id")
+    room_id_input_str = str(room_id_input).strip() if room_id_input is not None else ""
+    if use_active_context and active_room_id is not None:
+        room_id_str = str(active_room_id).strip()
+    elif room_id_input_str:
+        room_id_str = room_id_input_str
+    elif active_room_id is not None:
+        room_id_str = str(active_room_id).strip()
+    else:
+        return jsonify({
+            "success": False,
+            "message": "room_id is missing and no active room found from seat-charges",
+            "status_code": None,
+        }), 400
+
+    if allowed_methods and auth_method_norm not in allowed_methods:
+        return jsonify({
+            "success": False,
+            "message": f"{auth_method_norm} is not allowed for active reservation",
+            "status_code": 400,
+            "allowed_methods": allowed_methods,
+            "active_room_id": active_room_id,
+        }), 400
+
     url = CHECK_ARRIVAL_TEMPLATE.format(room_id=room_id_str)
 
     serial_variants: list[str] = []
@@ -376,6 +519,13 @@ def auto_confirm():
             "response_content_type": last_resp.headers.get("Content-Type"),
             "gps_used": {"latitude": latitude, "longitude": longitude},
             "attempt_logs": attempt_logs,
+            "seat_context": {
+                "use_active_context": use_active_context,
+                "room_id_input": room_id_input_str or None,
+                "active_room_id": active_room_id,
+                "allowed_methods": allowed_methods,
+                "checkin_expiry_date": expiry_text,
+            },
         }
     elif auth_method_norm == "RF_TAG":
         final_result["attempted_serial_count"] = len(serial_variants)
@@ -447,6 +597,44 @@ def extend_seat():
     result: dict = {}
     _attach_json(result, resp)
     code = 200 if result["success"] else (resp.status_code if resp.status_code >= 400 else 400)
+    return jsonify(result), code
+
+
+@app.route("/debug-seat-context", methods=["GET"])
+def debug_seat_context():
+    token, err = auto_login()
+    if not token:
+        return jsonify({
+            "success": False,
+            "message": f"auto login failed: {err}",
+            "status_code": None,
+        }), 502
+
+    seat_ctx, seat_ctx_err = _fetch_seat_context(token)
+    if not seat_ctx:
+        return jsonify({
+            "success": False,
+            "message": seat_ctx_err or "failed to fetch seat context",
+            "status_code": None,
+        }), 400
+
+    result: dict = dict(seat_ctx["wrapped"])
+    data = result.get("data")
+    active = seat_ctx["active"]
+    usage_ids = _dedupe_preserve(_collect_key_values(data, "usageId"))
+    room_ids_direct = _dedupe_preserve(_collect_key_values(data, "roomId"))
+    room_obj_ids = _dedupe_preserve(_collect_key_values(data, "id"))
+
+    result["hints"] = {
+        "seat_charges_url": SEAT_CHARGES_URL,
+        "found_usage_ids": usage_ids,
+        "found_room_ids": room_ids_direct,
+        "found_any_id_values": room_obj_ids[:50],
+        "active_charge": active,
+        "tip": "Use active_charge.room.id for room_id. Use one of active_charge.arrivalConfirmMethods.",
+    }
+
+    code = 200 if result["success"] else 400
     return jsonify(result), code
 
 
