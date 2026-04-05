@@ -35,6 +35,9 @@ LOGIN_URLS = (
 
 DEFAULT_LIBRARY_LATITUDE = float(os.environ.get("LIBRARY_LATITUDE", "37.539182674872"))
 DEFAULT_LIBRARY_LONGITUDE = float(os.environ.get("LIBRARY_LONGITUDE", "127.074711902268"))
+POST_CHECK_RETRIES = int(os.environ.get("POST_CHECK_RETRIES", "10"))
+POST_CHECK_INTERVAL_SEC = float(os.environ.get("POST_CHECK_INTERVAL_SEC", "0.8"))
+RECONFIRM_RETRIES = int(os.environ.get("RECONFIRM_RETRIES", "3"))
 
 EXTEND_URL_TEMPLATE = ""
 EXTEND_HTTP_METHOD = "POST"
@@ -360,6 +363,26 @@ def _is_confirmed_charge(charge: dict | None) -> bool:
     return False
 
 
+def _post_check_confirmed(
+    session: requests.Session,
+    token: str,
+    homepage_ids: list[int],
+    retries: int,
+    interval_sec: float,
+) -> tuple[bool, dict | None, str | None, dict | None]:
+    post_check_ctx: dict | None = None
+    post_check_err: str | None = None
+    post_check_active: dict | None = None
+    for _ in range(max(1, retries)):
+        post_check_ctx, post_check_err = _fetch_seat_context(session, token, homepage_ids=homepage_ids)
+        if post_check_ctx:
+            post_check_active = post_check_ctx.get("active")
+            if _is_confirmed_charge(post_check_active):
+                return True, post_check_ctx, post_check_err, post_check_active
+        time.sleep(max(0.1, interval_sec))
+    return False, post_check_ctx, post_check_err, post_check_active
+
+
 def _scan_seat_charges(session: requests.Session, token: str, homepage_ids: list[int]) -> list[dict]:
     rows: list[dict] = []
     for homepage_id in homepage_ids:
@@ -670,6 +693,8 @@ def auto_confirm():
     final_result: dict | None = None
     last_resp: requests.Response | None = None
     attempt_logs: list[dict[str, object]] = []
+    winner_url: str | None = None
+    winner_body: object | None = None
 
     homepage_candidates: list[int]
     if active_homepage_id is not None:
@@ -738,6 +763,8 @@ def auto_confirm():
 
                         final_result = result
                         if result.get("success") is True:
+                            winner_url = url
+                            winner_body = post_body
                             break
 
                     if final_result and final_result.get("success") is True:
@@ -763,15 +790,28 @@ def auto_confirm():
     post_check_err: str | None = None
     post_check_active: dict | None = None
     post_check_confirmed = False
+    reconfirm_attempts = 0
     if final_result.get("success") is True:
-        for _ in range(4):
-            post_check_ctx, post_check_err = _fetch_seat_context(session, token, homepage_ids=homepage_ids)
-            if post_check_ctx:
-                post_check_active = post_check_ctx.get("active")
-                if _is_confirmed_charge(post_check_active):
-                    post_check_confirmed = True
-                    break
-            time.sleep(0.8)
+        post_check_confirmed, post_check_ctx, post_check_err, post_check_active = _post_check_confirmed(
+            session=session,
+            token=token,
+            homepage_ids=homepage_ids,
+            retries=POST_CHECK_RETRIES,
+            interval_sec=POST_CHECK_INTERVAL_SEC,
+        )
+        while (not post_check_confirmed) and winner_url and (reconfirm_attempts < max(0, RECONFIRM_RETRIES)):
+            reconfirm_attempts += 1
+            try:
+                last_resp = session.post(winner_url, json=winner_body, headers=_headers(token), timeout=30)
+            except requests.RequestException:
+                break
+            post_check_confirmed, post_check_ctx, post_check_err, post_check_active = _post_check_confirmed(
+                session=session,
+                token=token,
+                homepage_ids=homepage_ids,
+                retries=POST_CHECK_RETRIES,
+                interval_sec=POST_CHECK_INTERVAL_SEC,
+            )
         if not post_check_confirmed:
             final_result["success"] = False
             final_result["message"] = (
@@ -801,6 +841,8 @@ def auto_confirm():
                 "error": post_check_err,
                 "active_charge": post_check_active,
                 "is_confirmed": post_check_confirmed,
+                "reconfirm_attempts": reconfirm_attempts,
+                "winner_url": winner_url,
                 "trace": post_check_ctx.get("traces") if post_check_ctx else None,
             },
         }
