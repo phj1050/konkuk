@@ -231,9 +231,21 @@ def _parse_kst_datetime(text: object) -> datetime | None:
 
 
 def _extract_active_charge(data: object) -> dict | None:
-    if not isinstance(data, dict):
-        return None
-    items = data.get("list")
+    items: list[object] | None = None
+    if isinstance(data, dict):
+        maybe_list = data.get("list")
+        if isinstance(maybe_list, list):
+            items = maybe_list
+        else:
+            # Some responses may already be a charge dict or use a different key.
+            for key in ("seatCharges", "charges", "items"):
+                alt = data.get(key)
+                if isinstance(alt, list):
+                    items = alt
+                    break
+    elif isinstance(data, list):
+        items = data
+
     if not isinstance(items, list):
         return None
 
@@ -271,13 +283,21 @@ def _fetch_seat_context(token: str, homepage_ids: list[int]) -> tuple[dict | Non
         wrapped: dict = {}
         _attach_json(wrapped, resp)
         data = wrapped.get("data")
-        total_count = data.get("totalCount") if isinstance(data, dict) else None
+        total_count: int | None = None
+        if isinstance(data, dict):
+            if isinstance(data.get("totalCount"), int):
+                total_count = int(data.get("totalCount"))
+            elif isinstance(data.get("list"), list):
+                total_count = len(data.get("list"))
+        elif isinstance(data, list):
+            total_count = len(data)
         traces.append({
             "homepage_id": homepage_id,
             "ok": bool(wrapped.get("success")),
             "status_code": wrapped.get("status_code"),
             "total_count": total_count,
             "message": wrapped.get("message"),
+            "data_type": type(data).__name__,
         })
 
         if not wrapped.get("success"):
@@ -293,7 +313,11 @@ def _fetch_seat_context(token: str, homepage_ids: list[int]) -> tuple[dict | Non
                 "seat_charges_url": url,
             }, None
 
-    return None, f"no active reservation found in seat-charges (traces={traces})"
+    return None, (
+        "no active reservation found in seat-charges. "
+        "Possible causes: account mismatch (LIBRARY_ID/PW), expired reservation, or different API shape. "
+        f"(traces={traces})"
+    )
 
 
 def _infer_business_success(http_ok: bool, parsed: object | None, message: str | None) -> bool:
@@ -424,6 +448,8 @@ def auto_confirm():
     debug = bool(body.get("debug"))
     use_active_context = _to_bool(body.get("use_active_context"), default=True)
     homepage_ids = _parse_homepage_ids(body.get("homepage_ids") or os.environ.get("HOMEPAGE_IDS"))
+    room_id_input = body.get("room_id")
+    room_id_input_str = str(room_id_input).strip() if room_id_input is not None else ""
 
     latitude = _to_float(body.get("latitude"))
     longitude = _to_float(body.get("longitude"))
@@ -459,38 +485,34 @@ def auto_confirm():
         }), 502
 
     seat_ctx, seat_ctx_err = _fetch_seat_context(token, homepage_ids=homepage_ids)
-    if not seat_ctx:
-        return jsonify({
-            "success": False,
-            "message": seat_ctx_err or "failed to fetch seat context",
-            "status_code": None,
-            "homepage_ids_tried": homepage_ids,
-        }), 400
+    active_charge: dict | None = None
+    active_homepage_id: int | None = None
+    active_room_id: object | None = None
+    allowed_methods: list[str] = []
+    expiry_text: object | None = None
 
-    active_charge = seat_ctx["active"]
-    active_homepage_id = int(seat_ctx["homepage_id"])
-    active_room_id = (
-        active_charge.get("room", {}).get("id")
-        if isinstance(active_charge.get("room"), dict)
-        else None
-    )
-    allowed_methods = active_charge.get("arrivalConfirmMethods")
-    if not isinstance(allowed_methods, list):
-        allowed_methods = []
+    if seat_ctx:
+        active_charge = seat_ctx["active"]
+        active_homepage_id = int(seat_ctx["homepage_id"])
+        active_room_id = (
+            active_charge.get("room", {}).get("id")
+            if isinstance(active_charge.get("room"), dict)
+            else None
+        )
+        allowed_methods_raw = active_charge.get("arrivalConfirmMethods")
+        if isinstance(allowed_methods_raw, list):
+            allowed_methods = [str(m).strip().upper() for m in allowed_methods_raw if str(m).strip()]
+        expiry_text = active_charge.get("checkinExpiryDate")
+        expiry_dt = _parse_kst_datetime(expiry_text)
+        now_kst = datetime.now(KST)
+        if expiry_dt and now_kst > expiry_dt:
+            return jsonify({
+                "success": False,
+                "message": f"check-in expired at {expiry_text} (KST)",
+                "status_code": 400,
+                "active_room_id": active_room_id,
+            }), 400
 
-    expiry_text = active_charge.get("checkinExpiryDate")
-    expiry_dt = _parse_kst_datetime(expiry_text)
-    now_kst = datetime.now(KST)
-    if expiry_dt and now_kst > expiry_dt:
-        return jsonify({
-            "success": False,
-            "message": f"check-in expired at {expiry_text} (KST)",
-            "status_code": 400,
-            "active_room_id": active_room_id,
-        }), 400
-
-    room_id_input = body.get("room_id")
-    room_id_input_str = str(room_id_input).strip() if room_id_input is not None else ""
     if use_active_context and active_room_id is not None:
         room_id_str = str(active_room_id).strip()
     elif room_id_input_str:
@@ -500,8 +522,10 @@ def auto_confirm():
     else:
         return jsonify({
             "success": False,
-            "message": "room_id is missing and no active room found from seat-charges",
+            "message": (seat_ctx_err or "room_id is missing and no active room found from seat-charges")
+            + " / You can retry with room_id manually and uncheck active-context.",
             "status_code": None,
+            "homepage_ids_tried": homepage_ids,
         }), 400
 
     if allowed_methods and auth_method_norm not in allowed_methods:
@@ -512,8 +536,6 @@ def auto_confirm():
             "allowed_methods": allowed_methods,
             "active_room_id": active_room_id,
         }), 400
-
-    url = _check_arrival_url(active_homepage_id, room_id_str)
 
     serial_variants: list[str] = []
     if auth_method_norm == "RF_TAG":
@@ -531,33 +553,47 @@ def auto_confirm():
     last_resp: requests.Response | None = None
     attempt_logs: list[dict[str, object]] = []
 
-    for serial in serial_variants:
-        request_payload = dict(payload)
-        if auth_method_norm == "RF_TAG":
-            request_payload["serialNo"] = serial
+    homepage_candidates: list[int]
+    if active_homepage_id is not None:
+        homepage_candidates = [active_homepage_id]
+    else:
+        homepage_candidates = homepage_ids
 
-        try:
-            resp = requests.post(url, json=[request_payload], headers=_headers(token), timeout=30)
-        except requests.RequestException as exc:
-            return jsonify({
-                "success": False,
-                "message": f"library API request failed: {exc}",
-                "status_code": None,
-            }), 502
+    for homepage_id in homepage_candidates:
+        url = _check_arrival_url(homepage_id, room_id_str)
+        for serial in serial_variants:
+            request_payload = dict(payload)
+            if auth_method_norm == "RF_TAG":
+                request_payload["serialNo"] = serial
 
-        last_resp = resp
-        result: dict = {"auth_method_used": auth_method_norm}
-        _attach_json(result, resp)
+            try:
+                resp = requests.post(url, json=[request_payload], headers=_headers(token), timeout=30)
+            except requests.RequestException as exc:
+                return jsonify({
+                    "success": False,
+                    "message": f"library API request failed: {exc}",
+                    "status_code": None,
+                }), 502
 
-        attempt_logs.append({
-            "serialNo": serial if auth_method_norm == "RF_TAG" else None,
-            "status_code": resp.status_code,
-            "success": result.get("success"),
-            "message": result.get("message"),
-        })
+            last_resp = resp
+            result = {
+                "auth_method_used": auth_method_norm,
+                "homepage_id_used": homepage_id,
+            }
+            _attach_json(result, resp)
 
-        final_result = result
-        if result.get("success") is True:
+            attempt_logs.append({
+                "homepage_id": homepage_id,
+                "serialNo": serial if auth_method_norm == "RF_TAG" else None,
+                "status_code": resp.status_code,
+                "success": result.get("success"),
+                "message": result.get("message"),
+            })
+
+            final_result = result
+            if result.get("success") is True:
+                break
+        if final_result and final_result.get("success") is True:
             break
 
     if final_result is None or last_resp is None:
@@ -569,7 +605,7 @@ def auto_confirm():
 
     if debug:
         final_result["debug"] = {
-            "request_url": url,
+            "request_url": _check_arrival_url(int(final_result.get("homepage_id_used") or homepage_candidates[0]), room_id_str),
             "request_payload": [payload],
             "response_content_type": last_resp.headers.get("Content-Type"),
             "gps_used": {"latitude": latitude, "longitude": longitude},
@@ -582,7 +618,8 @@ def auto_confirm():
                 "allowed_methods": allowed_methods,
                 "checkin_expiry_date": expiry_text,
                 "homepage_ids_tried": homepage_ids,
-                "seat_charges_trace": seat_ctx.get("traces"),
+                "seat_charges_trace": seat_ctx.get("traces") if seat_ctx else None,
+                "seat_context_error": seat_ctx_err if not seat_ctx else None,
             },
         }
     elif auth_method_norm == "RF_TAG":
