@@ -1,15 +1,9 @@
-"""
-건국대 도서관 SMUF: 원격 배정 확정(check-arrival) + 연장(extend) 프록시.
-
-- 매 요청마다 auto_login() 으로 토큰 발급 후 check-arrival / extend 호출
-- 자격 증명: 환경 변수 LIBRARY_ID, LIBRARY_PW (.env 권장, GitHub 에 올리지 말 것)
-- auth_method: "GPS" (고정 좌표) 또는 "RF_TAG" (NFC 고유번호) 선택 가능
-"""
 from __future__ import annotations
 
 import os
+import re
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
 
@@ -22,17 +16,6 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app)
-
-# ---------------------------------------------------------------------------
-# .env 예시 (프로젝트 폴더에 .env 파일 생성, 한 줄씩):
-#
-#   LIBRARY_ID=건국대통합로그인아이디
-#   LIBRARY_PW=비밀번호
-#
-# - 공백 없이 = 양쪽에 붙여 쓰기
-# - 비밀번호에 # 이나 따옴표가 있으면 값 전체를 큰따옴표로 감싸기
-# - Render: Dashboard → Environment → Add LIBRARY_ID, LIBRARY_PW
-# ---------------------------------------------------------------------------
 
 BASE = "https://library.konkuk.ac.kr/pyxis-api/1/api"
 
@@ -49,9 +32,8 @@ LOGIN_URLS = (
 
 CHECK_ARRIVAL_TEMPLATE = BASE + "/rooms/{room_id}/check-arrival"
 
-# 건국대 상허기념도서관 위경도 (GPS 인증용 고정값)
-LIBRARY_LATITUDE  = 37.539182674872
-LIBRARY_LONGITUDE = 127.074711902268
+DEFAULT_LIBRARY_LATITUDE = float(os.environ.get("LIBRARY_LATITUDE", "37.539182674872"))
+DEFAULT_LIBRARY_LONGITUDE = float(os.environ.get("LIBRARY_LONGITUDE", "127.074711902268"))
 
 EXTEND_URL_TEMPLATE = ""
 EXTEND_HTTP_METHOD = "POST"
@@ -59,14 +41,10 @@ EXTEND_PAYLOAD_TEMPLATE: dict | None = None
 
 
 def auto_login() -> tuple[str | None, str | None]:
-    """
-    도서관 로그인 API 호출 후 토큰 문자열 반환.
-    성공: (token, None) / 실패: (None, 사람이 읽을 수 있는 메시지)
-    """
     login_id = (os.environ.get("LIBRARY_ID") or "").strip()
     password = (os.environ.get("LIBRARY_PW") or "").strip()
     if not login_id or not password:
-        return None, "LIBRARY_ID 또는 LIBRARY_PW 가 환경 변수(.env)에 설정되어 있지 않습니다."
+        return None, "LIBRARY_ID or LIBRARY_PW is missing."
 
     payload = {
         "loginId": login_id,
@@ -85,7 +63,7 @@ def auto_login() -> tuple[str | None, str | None]:
         try:
             resp = requests.post(login_url, json=payload, headers=headers, timeout=30)
         except requests.RequestException as exc:
-            last_detail = f"{login_url}: 연결 실패 ({exc})"
+            last_detail = f"{login_url}: request failed ({exc})"
             continue
 
         for key, val in resp.headers.items():
@@ -95,16 +73,16 @@ def auto_login() -> tuple[str | None, str | None]:
         try:
             body = resp.json()
         except ValueError:
-            last_detail = f"{login_url}: HTTP {resp.status_code} (JSON 아님)"
+            last_detail = f"{login_url}: HTTP {resp.status_code} (non-JSON)"
             continue
 
         token = _extract_access_token_from_json(body)
         if token:
             return token, None
 
-        last_detail = f"{login_url}: HTTP {resp.status_code} — {body}"
+        last_detail = f"{login_url}: HTTP {resp.status_code} / {body}"
 
-    return None, last_detail or "로그인 응답에서 pyxis-auth-token / accessToken 을 찾지 못했습니다."
+    return None, last_detail or "login response does not contain auth token"
 
 
 def _extract_access_token_from_json(body: object) -> str | None:
@@ -129,12 +107,101 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
+def _to_float(val: object) -> float | None:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(str(val).strip())
+    except ValueError:
+        return None
+
+
+def _build_serial_variants(raw_serial: str) -> list[str]:
+    raw = (raw_serial or "").strip()
+    if not raw:
+        return []
+
+    variants: list[str] = []
+
+    def _add(v: str) -> None:
+        v = (v or "").strip()
+        if v and v not in variants:
+            variants.append(v)
+
+    _add(raw)
+
+    # 69:15:B8:56:08:01:04:E0 -> 6915B856080104E0
+    compact = re.sub(r"[^0-9A-Fa-f]", "", raw).upper()
+    if compact:
+        _add(compact)
+
+    # Reverse byte order variant: 6915... -> E004...
+    if compact and len(compact) % 2 == 0:
+        bytes_list = [compact[i:i + 2] for i in range(0, len(compact), 2)]
+        reversed_compact = "".join(reversed(bytes_list))
+        _add(reversed_compact)
+
+    return variants
+
+
+def _infer_business_success(http_ok: bool, parsed: object | None, message: str | None) -> bool:
+    if not http_ok:
+        return False
+
+    if isinstance(parsed, dict):
+        # Some APIs return top-level success=true but data.success=false.
+        # Prefer nested business result when available.
+        nested = parsed.get("data")
+        if isinstance(nested, dict):
+            for key in ("success", "result", "ok"):
+                if key in nested and isinstance(nested.get(key), bool):
+                    return bool(nested[key])
+
+        for key in ("success", "result", "ok"):
+            if key in parsed and isinstance(parsed.get(key), bool):
+                return bool(parsed[key])
+
+        for scope in (nested, parsed):
+            if not isinstance(scope, dict):
+                continue
+            status = scope.get("status")
+            if isinstance(status, str):
+                lowered = status.lower().strip()
+                if lowered in {"fail", "failed", "error"}:
+                    return False
+                if lowered in {"ok", "success", "succeeded"}:
+                    return True
+
+    text = (message or "").strip()
+    if not text:
+        return True
+
+    fail_patterns = (
+        r"\uC815\uBCF4\uAC00\s*\uC5C6",
+        r"\uC2E4\uD328",
+        r"\uBD88\uAC00",
+        r"\uC624\uB958",
+        r"error",
+        r"invalid",
+        r"not\s*found",
+        r"denied",
+    )
+    if any(re.search(pat, text, flags=re.IGNORECASE) for pat in fail_patterns):
+        return False
+
+    return True
+
+
 def _attach_json(result: dict, resp: requests.Response) -> None:
-    ok = resp.status_code in (200, 201)
-    result["success"] = ok
+    http_ok = resp.status_code in (200, 201)
+    result["http_ok"] = http_ok
     result["status_code"] = resp.status_code
+    parsed: object | None = None
     try:
         data = resp.json()
+        parsed = data
         result["data"] = data
         if isinstance(data, dict):
             if data.get("message") is not None:
@@ -148,43 +215,51 @@ def _attach_json(result: dict, resp: requests.Response) -> None:
     except ValueError:
         text = (resp.text or "").strip()
         result["data"] = None
-        result["message"] = text[:2000] if text else f"본문 없음 (HTTP {resp.status_code})"
+        result["message"] = text[:2000] if text else f"No body (HTTP {resp.status_code})"
+
+    result["success"] = _infer_business_success(http_ok, parsed, result.get("message"))
 
     if result.get("message") is None:
-        result["message"] = "OK" if ok else f"HTTP {resp.status_code}"
+        result["message"] = "OK" if result["success"] else f"HTTP {resp.status_code}"
 
 
 def _build_checkarrival_payload(auth_method: str, nfc_serial: str | None) -> tuple[dict | None, str | None]:
-    """
-    auth_method 에 따라 check-arrival 페이로드를 생성.
-    성공: (payload_dict, None) / 실패: (None, 오류 메시지)
-    """
+    return _build_checkarrival_payload_with_coords(
+        auth_method=auth_method,
+        nfc_serial=nfc_serial,
+        latitude=DEFAULT_LIBRARY_LATITUDE,
+        longitude=DEFAULT_LIBRARY_LONGITUDE,
+    )
+
+
+def _build_checkarrival_payload_with_coords(
+    auth_method: str,
+    nfc_serial: str | None,
+    latitude: float,
+    longitude: float,
+) -> tuple[dict | None, str | None]:
     method = auth_method.upper().strip()
 
     if method == "GPS":
         return {
             "methodCode": "GPS",
-            "latitude": LIBRARY_LATITUDE,
-            "longitude": LIBRARY_LONGITUDE,
+            "latitude": latitude,
+            "longitude": longitude,
         }, None
 
-    elif method == "RF_TAG":
+    if method == "RF_TAG":
         serial = (nfc_serial or "").strip()
         if not serial:
-            return None, "NFC(RF_TAG) 인증에는 nfc_serial(고유번호) 값이 필요합니다."
+            return None, "nfc_serial is required for RF_TAG"
         return {
             "methodCode": "RF_TAG",
             "serialNo": serial,
         }, None
 
-    elif method == "GATE":
+    if method == "GATE":
         return {"methodCode": "GATE"}, None
 
-    else:
-        return None, (
-            f"지원하지 않는 auth_method: '{auth_method}'. "
-            "'GPS', 'RF_TAG', 'GATE' 중 하나를 선택하세요."
-        )
+    return None, f"unsupported auth_method: {auth_method}"
 
 
 @app.route("/auto-confirm", methods=["POST"])
@@ -193,21 +268,37 @@ def auto_confirm():
     if not isinstance(body, dict):
         body = {}
 
-    # --- room_id 검증 ---
     room_id = body.get("room_id")
     if room_id is None or (isinstance(room_id, str) and not str(room_id).strip()):
         return jsonify({
             "success": False,
-            "message": "열람실 번호(room_id)를 보내 주세요.",
+            "message": "room_id is required",
             "status_code": None,
         }), 400
 
-    # --- auth_method 결정 (기본값 GPS) ---
     auth_method = str(body.get("auth_method") or "GPS").strip()
+    auth_method_norm = auth_method.upper()
     nfc_serial = body.get("nfc_serial") or body.get("serialNo")
+    debug = bool(body.get("debug"))
 
-    # --- 페이로드 조립 ---
-    payload, payload_err = _build_checkarrival_payload(auth_method, nfc_serial)
+    latitude = _to_float(body.get("latitude"))
+    longitude = _to_float(body.get("longitude"))
+    if auth_method_norm == "GPS":
+        if body.get("latitude") is not None and latitude is None:
+            return jsonify({"success": False, "message": "latitude must be a number", "status_code": None}), 400
+        if body.get("longitude") is not None and longitude is None:
+            return jsonify({"success": False, "message": "longitude must be a number", "status_code": None}), 400
+    if latitude is None:
+        latitude = DEFAULT_LIBRARY_LATITUDE
+    if longitude is None:
+        longitude = DEFAULT_LIBRARY_LONGITUDE
+
+    payload, payload_err = _build_checkarrival_payload_with_coords(
+        auth_method=auth_method_norm,
+        nfc_serial=nfc_serial,
+        latitude=latitude,
+        longitude=longitude,
+    )
     if payload is None:
         return jsonify({
             "success": False,
@@ -215,35 +306,83 @@ def auto_confirm():
             "status_code": None,
         }), 400
 
-    # --- 자동 로그인 ---
     token, err = auto_login()
     if not token:
         return jsonify({
             "success": False,
-            "message": f"자동 로그인 실패: {err}",
+            "message": f"auto login failed: {err}",
             "status_code": None,
         }), 502
 
-    # --- check-arrival 호출 ---
     room_id_str = str(room_id).strip()
     url = CHECK_ARRIVAL_TEMPLATE.format(room_id=room_id_str)
 
-    try:
-        # ★★★ 여기가 멍청하게 막혀있던 원흉입니다. json=[payload] 로 배열 처리! ★★★
-        resp = requests.post(url, json=[payload], headers=_headers(token), timeout=30)
-    except requests.RequestException as exc:
+    serial_variants: list[str] = []
+    if auth_method_norm == "RF_TAG":
+        serial_variants = _build_serial_variants(str(nfc_serial or ""))
+        if not serial_variants:
+            return jsonify({
+                "success": False,
+                "message": "nfc_serial is required for RF_TAG",
+                "status_code": None,
+            }), 400
+    else:
+        serial_variants = [""]
+
+    final_result: dict | None = None
+    last_resp: requests.Response | None = None
+    attempt_logs: list[dict[str, object]] = []
+
+    for serial in serial_variants:
+        request_payload = dict(payload)
+        if auth_method_norm == "RF_TAG":
+            request_payload["serialNo"] = serial
+
+        try:
+            resp = requests.post(url, json=[request_payload], headers=_headers(token), timeout=30)
+        except requests.RequestException as exc:
+            return jsonify({
+                "success": False,
+                "message": f"library API request failed: {exc}",
+                "status_code": None,
+            }), 502
+
+        last_resp = resp
+        result: dict = {"auth_method_used": auth_method_norm}
+        _attach_json(result, resp)
+
+        attempt_logs.append({
+            "serialNo": serial if auth_method_norm == "RF_TAG" else None,
+            "status_code": resp.status_code,
+            "success": result.get("success"),
+            "message": result.get("message"),
+        })
+
+        final_result = result
+        if result.get("success") is True:
+            break
+
+    if final_result is None or last_resp is None:
         return jsonify({
             "success": False,
-            "message": f"도서관 서버 연결 실패: {exc}",
+            "message": "unknown error: no response from library API",
             "status_code": None,
         }), 502
 
-    result: dict = {"auth_method_used": auth_method}
-    _attach_json(result, resp)
-    code = 200 if result["success"] else (
-        resp.status_code if resp.status_code >= 400 else 400
-    )
-    return jsonify(result), code
+    if debug:
+        final_result["debug"] = {
+            "request_url": url,
+            "request_payload": [payload],
+            "response_content_type": last_resp.headers.get("Content-Type"),
+            "gps_used": {"latitude": latitude, "longitude": longitude},
+            "attempt_logs": attempt_logs,
+        }
+    elif auth_method_norm == "RF_TAG":
+        final_result["attempted_serial_count"] = len(serial_variants)
+        final_result["attempted_serials"] = serial_variants
+
+    code = 200 if final_result["success"] else (last_resp.status_code if last_resp.status_code >= 400 else 400)
+    return jsonify(final_result), code
 
 
 @app.route("/extend", methods=["POST"])
@@ -251,10 +390,7 @@ def extend_seat():
     if not EXTEND_URL_TEMPLATE or not str(EXTEND_URL_TEMPLATE).strip():
         return jsonify({
             "success": False,
-            "message": (
-                "연장 API URL 이 아직 설정되지 않았습니다. app.py 의 EXTEND_URL_TEMPLATE 에 "
-                "도서관 사이트에서 [연장] 클릭 시 Network 에 나온 Request URL 을 넣으세요."
-            ),
+            "message": "EXTEND_URL_TEMPLATE is not configured.",
             "status_code": None,
         }), 501
 
@@ -266,7 +402,7 @@ def extend_seat():
     if not token:
         return jsonify({
             "success": False,
-            "message": f"자동 로그인 실패: {err}",
+            "message": f"auto login failed: {err}",
             "status_code": None,
         }), 502
 
@@ -276,7 +412,7 @@ def extend_seat():
         if usage_id is None or (isinstance(usage_id, str) and not usage_id.strip()):
             return jsonify({
                 "success": False,
-                "message": "연장 URL 에 {usage_id} 가 있으면 POST JSON 에 usage_id 가 필요합니다.",
+                "message": "usage_id is required for this extend URL",
                 "status_code": None,
             }), 400
         url = url.format(usage_id=str(usage_id).strip())
@@ -298,45 +434,37 @@ def extend_seat():
         else:
             return jsonify({
                 "success": False,
-                "message": f"지원하지 않는 EXTEND_HTTP_METHOD: {method}",
+                "message": f"unsupported EXTEND_HTTP_METHOD: {method}",
                 "status_code": None,
             }), 500
     except requests.RequestException as exc:
         return jsonify({
             "success": False,
-            "message": f"도서관 서버 연결 실패: {exc}",
+            "message": f"library API request failed: {exc}",
             "status_code": None,
         }), 502
 
     result: dict = {}
     _attach_json(result, resp)
-    code = 200 if result["success"] else (
-        resp.status_code if resp.status_code >= 400 else 400
-    )
+    code = 200 if result["success"] else (resp.status_code if resp.status_code >= 400 else 400)
     return jsonify(result), code
 
 
 @app.route("/", methods=["GET"])
 def root():
-    creds = bool(
-        (os.environ.get("LIBRARY_ID") or "").strip()
-        and (os.environ.get("LIBRARY_PW") or "").strip()
-    )
+    creds = bool((os.environ.get("LIBRARY_ID") or "").strip() and (os.environ.get("LIBRARY_PW") or "").strip())
     return jsonify({
         "ok": True,
         "auto_login_configured": creds,
         "extend_configured": bool(EXTEND_URL_TEMPLATE and EXTEND_URL_TEMPLATE.strip()),
         "supported_auth_methods": ["GPS", "RF_TAG", "GATE"],
-        "library_coords": {"latitude": LIBRARY_LATITUDE, "longitude": LIBRARY_LONGITUDE},
+        "library_coords": {"latitude": DEFAULT_LIBRARY_LATITUDE, "longitude": DEFAULT_LIBRARY_LONGITUDE},
     })
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    creds = bool(
-        (os.environ.get("LIBRARY_ID") or "").strip()
-        and (os.environ.get("LIBRARY_PW") or "").strip()
-    )
+    creds = bool((os.environ.get("LIBRARY_ID") or "").strip() and (os.environ.get("LIBRARY_PW") or "").strip())
     return jsonify({
         "ok": True,
         "auto_login_configured": creds,

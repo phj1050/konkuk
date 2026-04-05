@@ -238,6 +238,19 @@
 
       <label for="roomId">열람실 번호</label>
       <input type="text" id="roomId" inputmode="numeric" placeholder="예: 1" autocomplete="off" />
+
+      <label for="gpsLat">GPS 위도 (선택)</label>
+      <input type="text" id="gpsLat" inputmode="decimal" placeholder="비워두면 서버 기본값 사용" autocomplete="off" />
+
+      <label for="gpsLng">GPS 경도 (선택)</label>
+      <input type="text" id="gpsLng" inputmode="decimal" placeholder="비워두면 서버 기본값 사용" autocomplete="off" />
+
+      <p class="hint">디버그를 켜면 서버가 시도한 serial/응답 힌트를 더 자세히 돌려줍니다.</p>
+      <label style="display:flex; align-items:center; gap:8px; font-size:0.8rem; margin-top:8px; margin-bottom:6px; color:var(--text);">
+        <input type="checkbox" id="debugMode" />
+        디버그 모드 사용
+      </label>
+
       <button type="button" class="primary" id="btnConfirm">원격 확정</button>
       <div class="status" id="statusConfirm" aria-live="polite"><strong>결과</strong>대기 중</div>
     </div>
@@ -338,6 +351,11 @@
             room_id: room,
             auth_method: selectedMethod,
           };
+          const lat = document.getElementById("gpsLat").value.trim();
+          const lng = document.getElementById("gpsLng").value.trim();
+          if (lat) body.latitude = lat;
+          if (lng) body.longitude = lng;
+          body.debug = document.getElementById("debugMode").checked === true;
           if (selectedMethod === "RF_TAG") {
             body.nfc_serial = document.getElementById("nfcSerial").value.trim();
           }
