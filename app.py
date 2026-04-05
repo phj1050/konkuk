@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import re
@@ -42,11 +42,11 @@ KST = ZoneInfo("Asia/Seoul")
 DEFAULT_HOMEPAGE_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
-def auto_login() -> tuple[str | None, str | None]:
+def auto_login_session() -> tuple[str | None, requests.Session | None, str | None]:
     login_id = (os.environ.get("LIBRARY_ID") or "").strip()
     password = (os.environ.get("LIBRARY_PW") or "").strip()
     if not login_id or not password:
-        return None, "LIBRARY_ID or LIBRARY_PW is missing."
+        return None, None, "LIBRARY_ID or LIBRARY_PW is missing."
 
     payload = {
         "loginId": login_id,
@@ -61,16 +61,18 @@ def auto_login() -> tuple[str | None, str | None]:
 
     last_detail = ""
 
+    session = requests.Session()
+
     for login_url in LOGIN_URLS:
         try:
-            resp = requests.post(login_url, json=payload, headers=headers, timeout=30)
+            resp = session.post(login_url, json=payload, headers=headers, timeout=30)
         except requests.RequestException as exc:
             last_detail = f"{login_url}: request failed ({exc})"
             continue
 
         for key, val in resp.headers.items():
             if key.lower() == "pyxis-auth-token" and val and str(val).strip():
-                return str(val).strip(), None
+                return str(val).strip(), session, None
 
         try:
             body = resp.json()
@@ -80,11 +82,16 @@ def auto_login() -> tuple[str | None, str | None]:
 
         token = _extract_access_token_from_json(body)
         if token:
-            return token, None
+            return token, session, None
 
         last_detail = f"{login_url}: HTTP {resp.status_code} / {body}"
 
-    return None, last_detail or "login response does not contain auth token"
+    return None, None, last_detail or "login response does not contain auth token"
+
+
+def auto_login() -> tuple[str | None, str | None]:
+    token, _session, err = auto_login_session()
+    return token, err
 
 
 def _extract_access_token_from_json(body: object) -> str | None:
@@ -276,13 +283,17 @@ def _extract_active_charge(data: object) -> dict | None:
     return candidates[0]
 
 
-def _fetch_seat_context(token: str, homepage_ids: list[int]) -> tuple[dict | None, str | None]:
+def _fetch_seat_context(
+    session: requests.Session,
+    token: str,
+    homepage_ids: list[int],
+) -> tuple[dict | None, str | None]:
     traces: list[dict[str, object]] = []
 
     for homepage_id in homepage_ids:
         url = _seat_charges_url(homepage_id)
         try:
-            resp = requests.get(url, headers=_headers(token), timeout=30)
+            resp = session.get(url, headers=_headers(token), timeout=30)
         except requests.RequestException as exc:
             traces.append({"homepage_id": homepage_id, "ok": False, "error": str(exc)})
             continue
@@ -329,13 +340,13 @@ def _fetch_seat_context(token: str, homepage_ids: list[int]) -> tuple[dict | Non
     )
 
 
-def _scan_seat_charges(token: str, homepage_ids: list[int]) -> list[dict]:
+def _scan_seat_charges(session: requests.Session, token: str, homepage_ids: list[int]) -> list[dict]:
     rows: list[dict] = []
     for homepage_id in homepage_ids:
         url = _seat_charges_url(homepage_id)
         row: dict[str, object] = {"homepage_id": homepage_id, "url": url}
         try:
-            resp = requests.get(url, headers=_headers(token), timeout=30)
+            resp = session.get(url, headers=_headers(token), timeout=30)
         except requests.RequestException as exc:
             row["request_error"] = str(exc)
             rows.append(row)
@@ -522,15 +533,15 @@ def auto_confirm():
             "status_code": None,
         }), 400
 
-    token, err = auto_login()
-    if not token:
+    token, session, err = auto_login_session()
+    if not token or session is None:
         return jsonify({
             "success": False,
             "message": f"auto login failed: {err}",
             "status_code": None,
         }), 502
 
-    seat_ctx, seat_ctx_err = _fetch_seat_context(token, homepage_ids=homepage_ids)
+    seat_ctx, seat_ctx_err = _fetch_seat_context(session, token, homepage_ids=homepage_ids)
     active_charge: dict | None = None
     active_homepage_id: int | None = None
     active_room_id: object | None = None
@@ -612,32 +623,43 @@ def auto_confirm():
             if auth_method_norm == "RF_TAG":
                 request_payload["serialNo"] = serial
 
-            try:
-                resp = requests.post(url, json=[request_payload], headers=_headers(token), timeout=30)
-            except requests.RequestException as exc:
-                return jsonify({
-                    "success": False,
-                    "message": f"library API request failed: {exc}",
-                    "status_code": None,
-                }), 502
+            payload_shapes: list[tuple[str, object]] = [
+                ("object", request_payload),
+                ("array", [request_payload]),
+            ]
 
-            last_resp = resp
-            result = {
-                "auth_method_used": auth_method_norm,
-                "homepage_id_used": homepage_id,
-            }
-            _attach_json(result, resp)
+            for payload_shape, post_body in payload_shapes:
+                try:
+                    resp = session.post(url, json=post_body, headers=_headers(token), timeout=30)
+                except requests.RequestException as exc:
+                    return jsonify({
+                        "success": False,
+                        "message": f"library API request failed: {exc}",
+                        "status_code": None,
+                    }), 502
 
-            attempt_logs.append({
-                "homepage_id": homepage_id,
-                "serialNo": serial if auth_method_norm == "RF_TAG" else None,
-                "status_code": resp.status_code,
-                "success": result.get("success"),
-                "message": result.get("message"),
-            })
+                last_resp = resp
+                result = {
+                    "auth_method_used": auth_method_norm,
+                    "homepage_id_used": homepage_id,
+                    "payload_shape_used": payload_shape,
+                }
+                _attach_json(result, resp)
 
-            final_result = result
-            if result.get("success") is True:
+                attempt_logs.append({
+                    "homepage_id": homepage_id,
+                    "payload_shape": payload_shape,
+                    "serialNo": serial if auth_method_norm == "RF_TAG" else None,
+                    "status_code": resp.status_code,
+                    "success": result.get("success"),
+                    "message": result.get("message"),
+                })
+
+                final_result = result
+                if result.get("success") is True:
+                    break
+
+            if final_result and final_result.get("success") is True:
                 break
         if final_result and final_result.get("success") is True:
             break
@@ -689,8 +711,8 @@ def extend_seat():
     if not isinstance(body, dict):
         body = {}
 
-    token, err = auto_login()
-    if not token:
+    token, session, err = auto_login_session()
+    if not token or session is None:
         return jsonify({
             "success": False,
             "message": f"auto login failed: {err}",
@@ -717,11 +739,11 @@ def extend_seat():
     method = (EXTEND_HTTP_METHOD or "POST").upper()
     try:
         if method == "POST":
-            resp = requests.post(url, json=payload, headers=_headers(token), timeout=30)
+            resp = session.post(url, json=payload, headers=_headers(token), timeout=30)
         elif method == "PATCH":
-            resp = requests.patch(url, json=payload, headers=_headers(token), timeout=30)
+            resp = session.patch(url, json=payload, headers=_headers(token), timeout=30)
         elif method == "PUT":
-            resp = requests.put(url, json=payload, headers=_headers(token), timeout=30)
+            resp = session.put(url, json=payload, headers=_headers(token), timeout=30)
         else:
             return jsonify({
                 "success": False,
@@ -744,15 +766,15 @@ def extend_seat():
 @app.route("/debug-seat-context", methods=["GET"])
 def debug_seat_context():
     homepage_ids = _parse_homepage_ids(request.args.get("homepage_ids") or os.environ.get("HOMEPAGE_IDS"))
-    token, err = auto_login()
-    if not token:
+    token, session, err = auto_login_session()
+    if not token or session is None:
         return jsonify({
             "success": False,
             "message": f"auto login failed: {err}",
             "status_code": None,
         }), 502
 
-    seat_ctx, seat_ctx_err = _fetch_seat_context(token, homepage_ids=homepage_ids)
+    seat_ctx, seat_ctx_err = _fetch_seat_context(session, token, homepage_ids=homepage_ids)
     if not seat_ctx:
         return jsonify({
             "success": False,
@@ -786,15 +808,15 @@ def debug_seat_context():
 @app.route("/debug-seat-context-raw", methods=["GET"])
 def debug_seat_context_raw():
     homepage_ids = _parse_homepage_ids(request.args.get("homepage_ids") or os.environ.get("HOMEPAGE_IDS"))
-    token, err = auto_login()
-    if not token:
+    token, session, err = auto_login_session()
+    if not token or session is None:
         return jsonify({
             "success": False,
             "message": f"auto login failed: {err}",
             "status_code": None,
         }), 502
 
-    rows = _scan_seat_charges(token, homepage_ids)
+    rows = _scan_seat_charges(session, token, homepage_ids)
     return jsonify({
         "success": True,
         "homepage_ids_tried": homepage_ids,
@@ -827,3 +849,7 @@ def health():
 if __name__ == "__main__":
     _port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=_port, debug=True)
+
+
+
+
