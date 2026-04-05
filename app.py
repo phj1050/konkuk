@@ -2,6 +2,7 @@
 
 import os
 import re
+import time
 from datetime import datetime
 
 from flask import Flask, jsonify, request
@@ -340,6 +341,25 @@ def _fetch_seat_context(
     )
 
 
+def _is_confirmed_charge(charge: dict | None) -> bool:
+    if not isinstance(charge, dict):
+        return False
+    state_code = ""
+    state = charge.get("state")
+    if isinstance(state, dict):
+        state_code = str(state.get("code") or "").strip().upper()
+    is_checkinable = bool(charge.get("isCheckinable"))
+    charge_time = charge.get("chargeTime")
+    # Confirmed usually means no longer TEMP_CHARGE or no longer checkinable.
+    if state_code and state_code != "TEMP_CHARGE":
+        return True
+    if not is_checkinable:
+        return True
+    if isinstance(charge_time, (int, float)) and charge_time > 0:
+        return True
+    return False
+
+
 def _scan_seat_charges(session: requests.Session, token: str, homepage_ids: list[int]) -> list[dict]:
     rows: list[dict] = []
     for homepage_id in homepage_ids:
@@ -493,6 +513,46 @@ def _build_checkarrival_payload_with_coords(
     return None, f"unsupported auth_method: {auth_method}"
 
 
+def _build_payload_variants(
+    auth_method_norm: str,
+    payload: dict,
+    serial: str | None,
+    room_id: str,
+    active_charge_id: object | None,
+) -> list[tuple[str, dict]]:
+    variants: list[tuple[str, dict]] = []
+    if auth_method_norm != "RF_TAG":
+        base = dict(payload)
+        if active_charge_id is not None:
+            base["chargeId"] = active_charge_id
+            base["seatChargeId"] = active_charge_id
+        base["roomId"] = room_id
+        variants.append(("base", base))
+        return variants
+
+    serial_val = str(serial or "").strip()
+    common = {}
+    if active_charge_id is not None:
+        common = {"chargeId": active_charge_id, "seatChargeId": active_charge_id}
+
+    candidates = [
+        {"methodCode": "RF_TAG", "serialNo": serial_val},
+        {"methodCode": "RF_TAG", "serial": serial_val},
+        {"method": "RF_TAG", "serialNo": serial_val},
+        {"code": "RF_TAG", "serialNo": serial_val},
+        {"arrivalConfirmMethod": "RF_TAG", "serialNo": serial_val},
+        {"methodCode": "RF_TAG", "rfTagSerial": serial_val},
+    ]
+
+    for idx, c in enumerate(candidates, start=1):
+        p = dict(c)
+        p["roomId"] = room_id
+        p.update(common)
+        variants.append((f"rf_tag_variant_{idx}", p))
+
+    return variants
+
+
 @app.route("/auto-confirm", methods=["POST"])
 def auto_confirm():
     body = request.get_json(silent=True)
@@ -569,6 +629,7 @@ def auto_confirm():
                 "status_code": 400,
                 "active_room_id": active_room_id,
             }), 400
+    active_charge_id = active_charge.get("id") if isinstance(active_charge, dict) else None
 
     if use_active_context and active_room_id is not None:
         room_id_str = str(active_room_id).strip()
@@ -617,46 +678,72 @@ def auto_confirm():
         homepage_candidates = homepage_ids
 
     for homepage_id in homepage_candidates:
-        url = _check_arrival_url(homepage_id, room_id_str)
+        endpoint_variants: list[tuple[str, str]] = [
+            ("room", _check_arrival_url(homepage_id, room_id_str)),
+        ]
+        base = _build_base(homepage_id)
+        if active_charge_id is not None:
+            endpoint_variants.extend([
+                ("seat_charge_id", f"{base}/seat-charges/{active_charge_id}/check-arrival"),
+                ("charge_id", f"{base}/charges/{active_charge_id}/check-arrival"),
+                ("seat_charges_root", f"{base}/seat-charges/check-arrival"),
+            ])
+
         for serial in serial_variants:
-            request_payload = dict(payload)
-            if auth_method_norm == "RF_TAG":
-                request_payload["serialNo"] = serial
+            payload_variants = _build_payload_variants(
+                auth_method_norm=auth_method_norm,
+                payload=payload,
+                serial=serial if auth_method_norm == "RF_TAG" else None,
+                room_id=room_id_str,
+                active_charge_id=active_charge_id,
+            )
 
-            payload_shapes: list[tuple[str, object]] = [
-                ("object", request_payload),
-                ("array", [request_payload]),
-            ]
+            for endpoint_name, url in endpoint_variants:
+                for payload_variant_name, request_payload in payload_variants:
+                    payload_shapes: list[tuple[str, object]] = [
+                        ("object", request_payload),
+                        ("array", [request_payload]),
+                    ]
 
-            for payload_shape, post_body in payload_shapes:
-                try:
-                    resp = session.post(url, json=post_body, headers=_headers(token), timeout=30)
-                except requests.RequestException as exc:
-                    return jsonify({
-                        "success": False,
-                        "message": f"library API request failed: {exc}",
-                        "status_code": None,
-                    }), 502
+                    for payload_shape, post_body in payload_shapes:
+                        try:
+                            resp = session.post(url, json=post_body, headers=_headers(token), timeout=30)
+                        except requests.RequestException as exc:
+                            return jsonify({
+                                "success": False,
+                                "message": f"library API request failed: {exc}",
+                                "status_code": None,
+                            }), 502
 
-                last_resp = resp
-                result = {
-                    "auth_method_used": auth_method_norm,
-                    "homepage_id_used": homepage_id,
-                    "payload_shape_used": payload_shape,
-                }
-                _attach_json(result, resp)
+                        last_resp = resp
+                        result = {
+                            "auth_method_used": auth_method_norm,
+                            "homepage_id_used": homepage_id,
+                            "endpoint_variant_used": endpoint_name,
+                            "payload_variant_used": payload_variant_name,
+                            "payload_shape_used": payload_shape,
+                        }
+                        _attach_json(result, resp)
 
-                attempt_logs.append({
-                    "homepage_id": homepage_id,
-                    "payload_shape": payload_shape,
-                    "serialNo": serial if auth_method_norm == "RF_TAG" else None,
-                    "status_code": resp.status_code,
-                    "success": result.get("success"),
-                    "message": result.get("message"),
-                })
+                        attempt_logs.append({
+                            "homepage_id": homepage_id,
+                            "endpoint_variant": endpoint_name,
+                            "payload_variant": payload_variant_name,
+                            "payload_shape": payload_shape,
+                            "serialNo": serial if auth_method_norm == "RF_TAG" else None,
+                            "status_code": resp.status_code,
+                            "success": result.get("success"),
+                            "message": result.get("message"),
+                        })
 
-                final_result = result
-                if result.get("success") is True:
+                        final_result = result
+                        if result.get("success") is True:
+                            break
+
+                    if final_result and final_result.get("success") is True:
+                        break
+
+                if final_result and final_result.get("success") is True:
                     break
 
             if final_result and final_result.get("success") is True:
@@ -670,6 +757,27 @@ def auto_confirm():
             "message": "unknown error: no response from library API",
             "status_code": None,
         }), 502
+
+    # Safety check: API message can say "confirmed" while state remains TEMP_CHARGE.
+    post_check_ctx: dict | None = None
+    post_check_err: str | None = None
+    post_check_active: dict | None = None
+    post_check_confirmed = False
+    if final_result.get("success") is True:
+        for _ in range(4):
+            post_check_ctx, post_check_err = _fetch_seat_context(session, token, homepage_ids=homepage_ids)
+            if post_check_ctx:
+                post_check_active = post_check_ctx.get("active")
+                if _is_confirmed_charge(post_check_active):
+                    post_check_confirmed = True
+                    break
+            time.sleep(0.8)
+        if not post_check_confirmed:
+            final_result["success"] = False
+            final_result["message"] = (
+                "API response said confirmed, but reservation state is still TEMP_CHARGE "
+                "(not actually checked in yet)."
+            )
 
     if debug:
         final_result["debug"] = {
@@ -688,6 +796,12 @@ def auto_confirm():
                 "homepage_ids_tried": homepage_ids,
                 "seat_charges_trace": seat_ctx.get("traces") if seat_ctx else None,
                 "seat_context_error": seat_ctx_err if not seat_ctx else None,
+            },
+            "post_check": {
+                "error": post_check_err,
+                "active_charge": post_check_active,
+                "is_confirmed": post_check_confirmed,
+                "trace": post_check_ctx.get("traces") if post_check_ctx else None,
             },
         }
     elif auth_method_norm == "RF_TAG":
