@@ -231,6 +231,13 @@ def _parse_kst_datetime(text: object) -> datetime | None:
 
 
 def _extract_active_charge(data: object) -> dict | None:
+    # Some responses are wrapped as:
+    # {success, code, message, data:{totalCount, list:[...]}}
+    if isinstance(data, dict):
+        maybe_inner = data.get("data")
+        if isinstance(maybe_inner, (dict, list)):
+            data = maybe_inner
+
     items: list[object] | None = None
     if isinstance(data, dict):
         maybe_list = data.get("list")
@@ -283,28 +290,29 @@ def _fetch_seat_context(token: str, homepage_ids: list[int]) -> tuple[dict | Non
         wrapped: dict = {}
         _attach_json(wrapped, resp)
         data = wrapped.get("data")
+        data_inner = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
         total_count: int | None = None
-        if isinstance(data, dict):
-            if isinstance(data.get("totalCount"), int):
-                total_count = int(data.get("totalCount"))
-            elif isinstance(data.get("list"), list):
-                total_count = len(data.get("list"))
-        elif isinstance(data, list):
-            total_count = len(data)
+        if isinstance(data_inner, dict):
+            if isinstance(data_inner.get("totalCount"), int):
+                total_count = int(data_inner.get("totalCount"))
+            elif isinstance(data_inner.get("list"), list):
+                total_count = len(data_inner.get("list"))
+        elif isinstance(data_inner, list):
+            total_count = len(data_inner)
         traces.append({
             "homepage_id": homepage_id,
             "ok": bool(wrapped.get("success")),
             "status_code": wrapped.get("status_code"),
             "total_count": total_count,
             "message": wrapped.get("message"),
-            "data_type": type(data).__name__,
-            "data_keys": list(data.keys())[:20] if isinstance(data, dict) else None,
+            "data_type": type(data_inner).__name__,
+            "data_keys": list(data_inner.keys())[:20] if isinstance(data_inner, dict) else None,
         })
 
         if not wrapped.get("success"):
             continue
 
-        active = _extract_active_charge(data)
+        active = _extract_active_charge(data_inner)
         if active:
             return {
                 "wrapped": wrapped,
@@ -339,19 +347,20 @@ def _scan_seat_charges(token: str, homepage_ids: list[int]) -> list[dict]:
         row["success"] = wrapped.get("success")
         row["message"] = wrapped.get("message")
         data = wrapped.get("data")
-        row["data_type"] = type(data).__name__
-        if isinstance(data, dict):
-            row["data_keys"] = list(data.keys())[:30]
-            maybe_list = data.get("list")
+        data_inner = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)) else data
+        row["data_type"] = type(data_inner).__name__
+        if isinstance(data_inner, dict):
+            row["data_keys"] = list(data_inner.keys())[:30]
+            maybe_list = data_inner.get("list")
             row["list_len"] = len(maybe_list) if isinstance(maybe_list, list) else None
             if isinstance(maybe_list, list) and maybe_list and isinstance(maybe_list[0], dict):
                 row["first_item_keys"] = list(maybe_list[0].keys())[:30]
                 row["first_item"] = maybe_list[0]
-        elif isinstance(data, list):
-            row["list_len"] = len(data)
-            if data and isinstance(data[0], dict):
-                row["first_item_keys"] = list(data[0].keys())[:30]
-                row["first_item"] = data[0]
+        elif isinstance(data_inner, list):
+            row["list_len"] = len(data_inner)
+            if data_inner and isinstance(data_inner[0], dict):
+                row["first_item_keys"] = list(data_inner[0].keys())[:30]
+                row["first_item"] = data_inner[0]
 
         rows.append(row)
     return rows
