@@ -19,7 +19,7 @@ except ImportError:
 app = Flask(__name__)
 CORS(app)
 
-BASE = "https://library.konkuk.ac.kr/pyxis-api/1/api"
+PYXIS_API_ROOT = "https://library.konkuk.ac.kr/pyxis-api"
 
 USER_AGENT = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
@@ -32,9 +32,6 @@ LOGIN_URLS = (
     "https://library.konkuk.ac.kr/pyxis-api/1/api/login",
 )
 
-CHECK_ARRIVAL_TEMPLATE = BASE + "/rooms/{room_id}/check-arrival"
-SEAT_CHARGES_URL = BASE + "/seat-charges"
-
 DEFAULT_LIBRARY_LATITUDE = float(os.environ.get("LIBRARY_LATITUDE", "37.539182674872"))
 DEFAULT_LIBRARY_LONGITUDE = float(os.environ.get("LIBRARY_LONGITUDE", "127.074711902268"))
 
@@ -42,6 +39,7 @@ EXTEND_URL_TEMPLATE = ""
 EXTEND_HTTP_METHOD = "POST"
 EXTEND_PAYLOAD_TEMPLATE: dict | None = None
 KST = ZoneInfo("Asia/Seoul")
+DEFAULT_HOMEPAGE_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
 def auto_login() -> tuple[str | None, str | None]:
@@ -111,6 +109,18 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
+def _build_base(homepage_id: int) -> str:
+    return f"{PYXIS_API_ROOT}/{homepage_id}/api"
+
+
+def _check_arrival_url(homepage_id: int, room_id: str) -> str:
+    return _build_base(homepage_id) + f"/rooms/{room_id}/check-arrival"
+
+
+def _seat_charges_url(homepage_id: int) -> str:
+    return _build_base(homepage_id) + "/seat-charges"
+
+
 def _to_float(val: object) -> float | None:
     if val is None:
         return None
@@ -133,6 +143,28 @@ def _to_bool(val: object, default: bool = False) -> bool:
     if text in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _parse_homepage_ids(raw: object) -> list[int]:
+    if raw is None:
+        return list(DEFAULT_HOMEPAGE_IDS)
+    tokens: list[str] = []
+    if isinstance(raw, list):
+        tokens = [str(x).strip() for x in raw]
+    else:
+        tokens = [s.strip() for s in str(raw).split(",")]
+
+    out: list[int] = []
+    for t in tokens:
+        if not t:
+            continue
+        try:
+            num = int(t)
+        except ValueError:
+            continue
+        if num > 0 and num not in out:
+            out.append(num)
+    return out or list(DEFAULT_HOMEPAGE_IDS)
 
 
 def _build_serial_variants(raw_serial: str) -> list[str]:
@@ -225,23 +257,43 @@ def _extract_active_charge(data: object) -> dict | None:
     return candidates[0]
 
 
-def _fetch_seat_context(token: str) -> tuple[dict | None, str | None]:
-    try:
-        resp = requests.get(SEAT_CHARGES_URL, headers=_headers(token), timeout=30)
-    except requests.RequestException as exc:
-        return None, f"seat-charges request failed: {exc}"
+def _fetch_seat_context(token: str, homepage_ids: list[int]) -> tuple[dict | None, str | None]:
+    traces: list[dict[str, object]] = []
 
-    wrapped: dict = {}
-    _attach_json(wrapped, resp)
-    if not wrapped.get("success"):
-        return None, f"seat-charges failed: {wrapped.get('message')}"
+    for homepage_id in homepage_ids:
+        url = _seat_charges_url(homepage_id)
+        try:
+            resp = requests.get(url, headers=_headers(token), timeout=30)
+        except requests.RequestException as exc:
+            traces.append({"homepage_id": homepage_id, "ok": False, "error": str(exc)})
+            continue
 
-    data = wrapped.get("data")
-    active = _extract_active_charge(data)
-    if not active:
-        return None, "no active reservation found in seat-charges"
+        wrapped: dict = {}
+        _attach_json(wrapped, resp)
+        data = wrapped.get("data")
+        total_count = data.get("totalCount") if isinstance(data, dict) else None
+        traces.append({
+            "homepage_id": homepage_id,
+            "ok": bool(wrapped.get("success")),
+            "status_code": wrapped.get("status_code"),
+            "total_count": total_count,
+            "message": wrapped.get("message"),
+        })
 
-    return {"wrapped": wrapped, "active": active}, None
+        if not wrapped.get("success"):
+            continue
+
+        active = _extract_active_charge(data)
+        if active:
+            return {
+                "wrapped": wrapped,
+                "active": active,
+                "homepage_id": homepage_id,
+                "traces": traces,
+                "seat_charges_url": url,
+            }, None
+
+    return None, f"no active reservation found in seat-charges (traces={traces})"
 
 
 def _infer_business_success(http_ok: bool, parsed: object | None, message: str | None) -> bool:
@@ -371,6 +423,7 @@ def auto_confirm():
     nfc_serial = body.get("nfc_serial") or body.get("serialNo")
     debug = bool(body.get("debug"))
     use_active_context = _to_bool(body.get("use_active_context"), default=True)
+    homepage_ids = _parse_homepage_ids(body.get("homepage_ids") or os.environ.get("HOMEPAGE_IDS"))
 
     latitude = _to_float(body.get("latitude"))
     longitude = _to_float(body.get("longitude"))
@@ -405,15 +458,17 @@ def auto_confirm():
             "status_code": None,
         }), 502
 
-    seat_ctx, seat_ctx_err = _fetch_seat_context(token)
+    seat_ctx, seat_ctx_err = _fetch_seat_context(token, homepage_ids=homepage_ids)
     if not seat_ctx:
         return jsonify({
             "success": False,
             "message": seat_ctx_err or "failed to fetch seat context",
             "status_code": None,
+            "homepage_ids_tried": homepage_ids,
         }), 400
 
     active_charge = seat_ctx["active"]
+    active_homepage_id = int(seat_ctx["homepage_id"])
     active_room_id = (
         active_charge.get("room", {}).get("id")
         if isinstance(active_charge.get("room"), dict)
@@ -458,7 +513,7 @@ def auto_confirm():
             "active_room_id": active_room_id,
         }), 400
 
-    url = CHECK_ARRIVAL_TEMPLATE.format(room_id=room_id_str)
+    url = _check_arrival_url(active_homepage_id, room_id_str)
 
     serial_variants: list[str] = []
     if auth_method_norm == "RF_TAG":
@@ -522,9 +577,12 @@ def auto_confirm():
             "seat_context": {
                 "use_active_context": use_active_context,
                 "room_id_input": room_id_input_str or None,
+                "active_homepage_id": active_homepage_id,
                 "active_room_id": active_room_id,
                 "allowed_methods": allowed_methods,
                 "checkin_expiry_date": expiry_text,
+                "homepage_ids_tried": homepage_ids,
+                "seat_charges_trace": seat_ctx.get("traces"),
             },
         }
     elif auth_method_norm == "RF_TAG":
@@ -602,6 +660,7 @@ def extend_seat():
 
 @app.route("/debug-seat-context", methods=["GET"])
 def debug_seat_context():
+    homepage_ids = _parse_homepage_ids(request.args.get("homepage_ids") or os.environ.get("HOMEPAGE_IDS"))
     token, err = auto_login()
     if not token:
         return jsonify({
@@ -610,12 +669,13 @@ def debug_seat_context():
             "status_code": None,
         }), 502
 
-    seat_ctx, seat_ctx_err = _fetch_seat_context(token)
+    seat_ctx, seat_ctx_err = _fetch_seat_context(token, homepage_ids=homepage_ids)
     if not seat_ctx:
         return jsonify({
             "success": False,
             "message": seat_ctx_err or "failed to fetch seat context",
             "status_code": None,
+            "homepage_ids_tried": homepage_ids,
         }), 400
 
     result: dict = dict(seat_ctx["wrapped"])
@@ -626,7 +686,9 @@ def debug_seat_context():
     room_obj_ids = _dedupe_preserve(_collect_key_values(data, "id"))
 
     result["hints"] = {
-        "seat_charges_url": SEAT_CHARGES_URL,
+        "seat_charges_url": seat_ctx.get("seat_charges_url"),
+        "active_homepage_id": seat_ctx.get("homepage_id"),
+        "seat_charges_trace": seat_ctx.get("traces"),
         "found_usage_ids": usage_ids,
         "found_room_ids": room_ids_direct,
         "found_any_id_values": room_obj_ids[:50],
